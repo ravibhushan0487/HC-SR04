@@ -1,1 +1,78 @@
-sample code here
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+
+static int devices = 0;
+
+MODULE_PARM(devices, 0);
+MODULE_PARM_DESC(devices, "The number of HCSR devices to be created.");
+
+static int hcsr04_open(struct inode *inode, struct file *file)
+{
+    return 0;
+}
+
+static int hcsr04_close(struct inode *inodep, struct file *filp)
+{
+    return 0;
+}
+
+static ssize_t hcsr04_write(struct file *file, const char __user *buf,
+		       size_t len, loff_t *ppos)
+{
+    
+    return 0; 
+}
+
+static long hcsr04_ioctl(struct file * file, unsigned int ioctlnum, unsigned long arg)
+{   
+
+	return 0;
+}
+
+static const struct file_operations hcsr04_fops = {
+    .owner			= THIS_MODULE,
+    .write			= hcsr04_write,
+    .open			= hcsr04_open,
+    .release		= hcsr04_close,
+    .unlocked_ioctl = hcsr04_loctl
+};
+
+struct miscdevice hcsr04_device = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name = "HCSR_",
+    .fops = &hcsr04_fops,
+};
+
+static int __init hcsr04_init(void)
+{
+    int error;
+    error = misc_register(&hcsr04_device);
+    if (error) {
+        printk("Unable to register HCSR driver\n");
+        return error;
+    }
+
+    printk("HCSR driver registered with %d devices created.",devices);
+    return 0;
+}
+static void __exit hcsr04_exit(void)
+{
+	int error;
+    error = misc_deregister(&hcsr04_device);
+    if (error) {
+        printk("Unable to deregister HCSR driver\n");
+        return error;
+    }
+    printk("HCSR driver deregistered and %d devices deleted.",devices);
+}
+
+module_init(hcsr04_init)
+module_exit(hcsr04_exit)
+
+MODULE_DESCRIPTION("HCSR Driver");
+MODULE_AUTHOR("Ravi Bhushan <ravibhushan0487@gmail.com>");
+MODULE_LICENSE("GPL");
+
+
