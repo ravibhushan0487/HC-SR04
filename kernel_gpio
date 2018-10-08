@@ -1,0 +1,170 @@
+/* ----------------------------------------------- DRIVER gpiok --------------------------------------------------
+ 
+ Basic driver example to access goip in kernel space
+ 
+ ----------------------------------------------------------------------------------------------------------------*/
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/types.h>
+#include <linux/slab.h>
+#include <asm/uaccess.h>
+#include <linux/string.h>
+#include <linux/device.h>
+#include <linux/jiffies.h>
+#include <linux/gpio.h>
+
+#include <linux/init.h>
+#include <linux/moduleparam.h>
+
+#define DEVICE_NAME                 "gpiok"  // device name to be created and registered
+#define GPIO_NUMBER 62
+#define GPIO_NAME "gpio62"
+#define GPIO_MUX1 76
+#define GPIO_MUX1_NAME "gpio76"
+#define GPIO_MUX2 64
+#define GPIO_MUX2_NAME "gpio64"
+
+/* per device structure */
+struct gpiok_dev {
+	struct cdev cdev;
+} *gpiok_devp;
+
+static dev_t gpiok_dev_number;      /* Allotted device number */
+struct class *gpiok_dev_class;          /* Tie with the device model */
+static struct device *gpiok_dev_device;
+
+/*
+* Open gpiok driver
+*/
+int gpiok_driver_open(struct inode *inode, struct file *file)
+{
+	struct gpiok_dev *gpiok_devp;
+//	printk("\nopening\n");
+
+	/* Get the per-device structure that contains this cdev */
+	gpiok_devp = container_of(inode->i_cdev, struct gpiok_dev, cdev);
+
+
+	/* Easy access to cmos_devp from rest of the entry points */
+	file->private_data = gpiok_devp;
+	return 0;
+}
+
+/*
+ * Release gpiok driver
+ */
+int gpiok_driver_release(struct inode *inode, struct file *file)
+{
+	
+	return 0;
+}
+
+/*
+ * Write to gpiok driver
+ */
+ssize_t gpiok_driver_write(struct file *file, const char *buf,
+           size_t count, loff_t *ppos)
+{
+	return 0;
+}
+/*
+ * Read to gpiok driver
+ */
+ssize_t gpiok_driver_read(struct file *file, char *buf,
+           size_t count, loff_t *ppos)
+{
+	int bytes_read = 0;
+	
+	return bytes_read;
+
+}
+
+/* File operations structure. Defined in linux/fs.h */
+static struct file_operations gpiok_fops = {
+    .owner		= THIS_MODULE,           /* Owner */
+    .open		= gpiok_driver_open,        /* Open method */
+    .release	= gpiok_driver_release,     /* Release method */
+    .write		= gpiok_driver_write,       /* Write method */
+    .read		= gpiok_driver_read,        /* Read method */
+};
+
+/*
+ * Driver Initialization
+ */
+int __init gpiok_driver_init(void)
+{
+	int ret;
+
+	/* Request dynamic allocation of a device major number */
+	if (alloc_chrdev_region(&gpiok_dev_number, 0, 1, DEVICE_NAME) < 0) {
+			printk(KERN_DEBUG "Can't register device\n"); return -1;
+	}
+
+	/* Populate sysfs entries */
+	gpiok_dev_class = class_create(THIS_MODULE, DEVICE_NAME);
+
+	/* Allocate memory for the per-device structure */
+	gpiok_devp = kmalloc(sizeof(struct gpiok_dev), GFP_KERNEL);
+		
+	if (!gpiok_devp) {
+		printk("Bad Kmalloc\n"); return -ENOMEM;
+	}
+
+	
+	/* Connect the file operations with the cdev */
+	cdev_init(&gpiok_devp->cdev, &gpiok_fops);
+	gpiok_devp->cdev.owner = THIS_MODULE;
+
+	/* Connect the major/minor number to the cdev */
+	ret = cdev_add(&gpiok_devp->cdev, (gpiok_dev_number), 1);
+
+	if (ret) {
+		printk("Bad cdev\n");
+		return ret;
+	}
+
+	/* Send uevents to udev, so it'll create /dev nodes */
+	gpiok_dev_device = device_create(gpiok_dev_class, NULL, MKDEV(MAJOR(gpiok_dev_number), 0), NULL, DEVICE_NAME);		
+	// device_create_file(gpiok_dev_device, &dev_attr_xxx);
+
+	gpio_request(GPIO_NUMBER, GPIO_NAME);
+	gpio_request(GPIO_MUX1, GPIO_MUX1_NAME);
+	gpio_request(GPIO_MUX2, GPIO_MUX2_NAME);
+	
+	gpio_direction_output(GPIO_MUX1, 0);
+	gpio_set_value(GPIO_MUX1, 0);
+	gpio_direction_output(GPIO_MUX2, 0);
+	gpio_set_value(GPIO_MUX2, 0);
+	gpio_direction_output(GPIO_NUMBER, 1);
+	gpio_set_value(GPIO_NUMBER, 1);
+
+	printk("gpiok 123 driver initialized.\n");
+	return 0;
+}
+/* Driver Exit */
+void __exit gpiok_driver_exit(void)
+{
+	// device_remove_file(gpiok_dev_device, &dev_attr_xxx);
+	/* Release the major number */
+	gpio_free(GPIO_NUMBER);
+	gpio_free(GPIO_MUX1);
+	gpio_free(GPIO_MUX2);
+	unregister_chrdev_region((gpiok_dev_number), 1);
+
+	/* Destroy device */
+	device_destroy (gpiok_dev_class, MKDEV(MAJOR(gpiok_dev_number), 0));
+	cdev_del(&gpiok_devp->cdev);
+	kfree(gpiok_devp);
+	
+	/* Destroy driver_class */
+	class_destroy(gpiok_dev_class);
+
+	printk("gpiok driver removed.\n");
+}
+
+module_init(gpiok_driver_init);
+module_exit(gpiok_driver_exit);
+MODULE_LICENSE("GPL v2");
