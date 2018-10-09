@@ -2,10 +2,11 @@
 #include <linux/fs.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/list.h>
 
-static int devices = 0;
+static int devices = 1;
 
-MODULE_PARM(devices, 0);
+MODULE_PARM(devices, 1);
 MODULE_PARM_DESC(devices, "The number of HCSR devices to be created.");
 
 static int hcsr04_open(struct inode *inode, struct file *file)
@@ -39,32 +40,63 @@ static const struct file_operations hcsr04_fops = {
     .unlocked_ioctl = hcsr04_loctl
 };
 
-struct miscdevice hcsr04_device = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name = "HCSR_",
-    .fops = &hcsr04_fops,
-};
+struct hcsr04_device hcsr04_device_list{
+	struct miscdevice hcsr04;
+	struct list_head list;
+	int trigger_pin;
+	int echo_pin;
+	int m; //Total samples to be collected
+	int delta; //Time period of sample collection
+	//code for fifo buffer
+}
 
 static int __init hcsr04_init(void)
 {
-    int error;
-    error = misc_register(&hcsr04_device);
-    if (error) {
-        printk("Unable to register HCSR driver\n");
-        return error;
-    }
+	int index;
+	int error;
+	struct hcsr04_device *misc_hcsr04_device;
+
+	INIT_LIST_HEAD(&hcsr04_device_list.list);
+
+	for(index=0; index < devices;index++)
+	{
+		misc_hcsr04_device = (struct hcsr04_device *)malloc(sizeof(struct hcsr04_device));
+		misc_hcsr04_device->hcsr04_device.minor = MISC_DYNAMIC_MINOR;
+		misc_hcsr04_device->hcsr04_device.name = "HCSR_"+index;
+		misc_hcsr04_device->hcsr04_device.fops = &hcsr04_fops;
+
+	    error = misc_register(&(misc_hcsr04_device->hcsr04_device));
+	    if (error) 
+	    {
+	        printk("Unable to register HCSR_%d device\n",index);
+	        return error;
+	    }
+	    list_add(&(misc_hcsr04_device->list), &(hcsr04_device_list.list));
+
+	}
 
     printk("HCSR driver registered with %d devices created.",devices);
     return 0;
 }
+
 static void __exit hcsr04_exit(void)
 {
 	int error;
-    error = misc_deregister(&hcsr04_device);
-    if (error) {
-        printk("Unable to deregister HCSR driver\n");
-        return error;
-    }
+	struct hcsr04_device *misc_hcsr04_device;
+	struct hcsr04_device *pos, *q;
+	
+	list_for_each_safe(pos, q, &hcsr04_device_list.list)
+	{
+		misc_hcsr04_device = list_entry(pos, struct hcsr04_device, list);
+		error = misc_deregister(misc_hcsr04_device);
+	    if (error) {
+	        printk("Unable to deregister HCSR device\n");
+	        return error;
+	    }
+		list_del(pos);
+		free(misc_hcsr04_device);
+	}
+	    
     printk("HCSR driver deregistered and %d devices deleted.",devices);
 }
 
@@ -74,5 +106,4 @@ module_exit(hcsr04_exit)
 MODULE_DESCRIPTION("HCSR Driver");
 MODULE_AUTHOR("Ravi Bhushan <ravibhushan0487@gmail.com>");
 MODULE_LICENSE("GPL");
-
 
