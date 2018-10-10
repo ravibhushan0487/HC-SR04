@@ -206,7 +206,7 @@ static int hcsr04_read(struct file *file, char * buf, size_t count, loff_t *ppos
 	struct fifo_buffer *buffer = fifoRead(device);
 	if(buffer->distance == BUFFER_EMPTY)
 	{
-		printk(KERN_ALERT "FIFO buffer or device %d is empty\n",device->misc.name);
+		printk(KERN_ALERT "FIFO buffer or device %s is empty\n",device->misc.name);
 		if(measurement_in_progress)
 	    {
 	    	printk(KERN_ALERT "Measurement in progress\n");
