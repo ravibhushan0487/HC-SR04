@@ -329,6 +329,7 @@ int pin_config(int pin, int io_flag, bool val, int configure)
 }
 
 //Configure pins as trigger or echo
+//Trigger pin has been set to low here. Need to set it to high during call to interrupts
 int configure_pins(struct hcsr04_device *device) 
 {
 	struct gen2_pin_config *gen2_pin;
