@@ -9,6 +9,9 @@
 #include <linux/uaccess.h>
 #include <linux/completion.h>
 #include <linux/ioctl.h>
+#include <linux/gpio.h>
+#include <linux/irq.h>
+#include <linux/interrupt.h>
 
 //TODO: Delete the below headers in final code.
 #include <linux/random.h>
@@ -96,6 +99,8 @@ struct gen2_pin_config {
 	int pinmux_1_level; //1 for High and 0 for Low
 	int pinmux_2;
 	int pinmux_2_level; //1 for High and 0 for Low
+	int is_pin_configured; //1 if gpio_request has been called. 0 otherwise or when gpio_free has been called
+	int device_minor_number; //Minor Number of the device who configured the pin
 	struct list_head list;
 } gen2_pin_list;
 
@@ -124,7 +129,7 @@ void initialize_device(struct hcsr04_device *device)
 }
 
 //Store data related to a single pin
-//-1 indicates that there is no pin to be configured
+//NO_PIN indicates that there is no pin to be configured
 void populate_pin_data(int galileo_pin,int linux_gpio_pin, int level_shifter_pin, 
 	int pinmux_1,int pinmux_1_level, int pinmux_2, int pinmux_2_level)
 {
@@ -137,12 +142,14 @@ void populate_pin_data(int galileo_pin,int linux_gpio_pin, int level_shifter_pin
 	gen2_pin->pinmux_1_level = pinmux_1_level;
 	gen2_pin->pinmux_2 = pinmux_2;
 	gen2_pin->pinmux_2_level = pinmux_2_level;
+	gen2_pin->is_pin_configured = 0;
+
 	list_add(&(gen2_pin->list), &(gen2_pin_list.list));
 
 }
 
 //Stores Galileo Gen2 Digital Pins configuration data
-//-1 indicates that there is no pin to be configured
+//NO_PIN indicates that there is no pin to be configured
 //Source Gen2_pins.xlsx
 int populate_gen2_pins_data(void) 
 {
@@ -203,7 +210,8 @@ struct fifo_buffer* fifoRead(struct hcsr04_device *device) {
 	   	buffer->distance = BUFFER_EMPTY;
 	   	buffer->tsc = 0;
 	   	return buffer;
-   } else
+   } 
+   else
    {
 	   	buffer->distance = device->buffer[device->FIFOWrite]->distance;
 	   	buffer->tsc = device->buffer[device->FIFOWrite]->tsc; 
@@ -233,34 +241,203 @@ int fifoWrite(struct hcsr04_device *device, struct fifo_buffer *buffer)
    return SUCCESS;
 }
 
-
-
-
-//Configure pin as output pin
-int configure_trigger_pin(struct hcsr04_device *device) 
+//Free Gpio pins
+void release_gpio_pins(struct hcsr04_device *device)
 {
-	//sprintf(device_name, "HCSR_%d", index);
-	return 1;
+	struct gen2_pin_config *gen2_pin;
+	struct list_head *gpio_pos;
+	
+	list_for_each(gpio_pos, &gen2_pin_list.list)
+	{
+		gen2_pin = list_entry(gpio_pos, struct gen2_pin_config, list);
+		
+		//Device is null when all this function is called during exit module
+		//Else, release only those pins which have been set by the device whole release function has been called
+		if(gen2_pin->is_pin_configured && (device == NULL || device->misc.minor == gen2_pin->device_minor_number))
+		{
+			
+			//Free Linux GPIO pin
+			gpio_free(gen2_pin->linux_gpio_pin);
+            gpio_unexport(gen2_pin->linux_gpio_pin);
+            
+            //Free Level Shifter Pin
+            if(gen2_pin->level_shifter_pin != NO_PIN) 
+            {
+            	gpio_free(gen2_pin->level_shifter_pin);
+            	gpio_unexport(gen2_pin->level_shifter_pin);
+            }
+
+             //Free PINMUX 1 Pin
+            if(gen2_pin->pinmux_1 != NO_PIN) 
+            {
+            	gpio_free(gen2_pin->pinmux_1);
+            	gpio_unexport(gen2_pin->pinmux_1);
+            }
+
+             //Free PINMUX 2 Pin
+            if(gen2_pin->pinmux_2 != NO_PIN) 
+            {
+            	gpio_free(gen2_pin->pinmux_2);
+            	gpio_unexport(gen2_pin->pinmux_2);
+            }
+            gen2_pin->is_pin_configured = 0;
+            gen2_pin->device_minor_number = NO_VALUE;
+		}
+	}
+	    
 }
 
-//Configure pin as edge trigerred input
-int configure_echo_pin(struct hcsr04_device *device)
+/*Single PIN CONFIG
+**pin: GPIO pin number
+**io_flag: 0 -> Input, 1 -> Output
+**Val: value of the pin. 1 -> High, 0 -> Low
+**configure: if configured for the first time*/
+int pin_config(int pin, int io_flag, bool val, int configure)
+{ 
+    int ret;
+    char *name;
+    
+    if(configure)
+    {
+    	name = (char *)kmalloc(sizeof(char), GFP_KERNEL);
+		sprintf(name, "gpio%d", pin);
+        ret = gpio_request(pin, name);
+        if(ret)
+        { 
+        	printk(KERN_ALERT "GPIO Request Failed %d\n", pin); 
+        	return 1;
+        }
+        gpio_export(pin, false);
+    }   
+    if (io_flag)
+    {
+    	gpio_direction_output(pin, val);
+    }
+    else
+    {
+     	gpio_direction_input(pin);   
+    }
+    if(gpio_cansleep(pin))
+    {
+    	gpio_set_value_cansleep(pin, 0);
+    }
+    else
+    {
+    	gpio_set_value(pin, 0);
+    }
+    return 0;
+}
+
+//Configure pins as trigger or echo
+int configure_pins(struct hcsr04_device *device) 
 {
+	struct gen2_pin_config *gen2_pin;
+	struct list_head *gpio_pos;
+	int pin_confg_ret, io_flag;
+	
+	list_for_each(gpio_pos, &gen2_pin_list.list)
+	{
+		gen2_pin = list_entry(gpio_pos, struct gen2_pin_config, list);
+		if(device->trigger_pin == gen2_pin->galileo_pin || device->echo_pin == gen2_pin->galileo_pin)
+		{
+			if(device->echo_pin == gen2_pin->galileo_pin)
+			{
+				io_flag = 0;
+			}
+			else
+			{
+				io_flag = 1;
+			}
+			//Check if Pin has already been configured. If yes then do not call gpio_export again
+			if(gen2_pin->is_pin_configured)
+			{
+				//Check if Pin has been configued by the same device. If no then return error
+				if(device->misc.minor != gen2_pin->device_minor_number) 
+				{
+					printk(KERN_ALERT "Pin %d already configured by some other device",device->trigger_pin);
+					return 0;
+				}
+				//Pin has been configured by the same device. Update Pin's function to be a trigger pin
+				//COnfigure Linux Pin
+				pin_confg_ret = pin_config(gen2_pin->linux_gpio_pin,io_flag,0,0);
+				if(pin_confg_ret)
+		        { 
+		        	printk(KERN_ALERT "GPIO Request Failed %d\n", gen2_pin->linux_gpio_pin); 
+		        	return 0;
+		        }
+
+		        //Configure Level Shifter Pin
+				if(gen2_pin->level_shifter_pin != NO_PIN) 
+				{
+					pin_confg_ret = pin_config(gen2_pin->level_shifter_pin,io_flag,0,0);
+					if(pin_confg_ret)
+			        { 
+			        	printk(KERN_ALERT "GPIO Request Failed %d\n", gen2_pin->level_shifter_pin); 
+			        	return 0;
+			        }
+				}
+			}
+			else
+			{
+				//Pin has not been configured. Configure Pin and make it a trigger pin
+				
+				//COnfigure Linux Pin
+				pin_confg_ret = pin_config(gen2_pin->linux_gpio_pin,io_flag,0,1);
+				if(pin_confg_ret)
+		        { 
+		        	printk(KERN_ALERT "GPIO Request Failed %d\n", gen2_pin->linux_gpio_pin); 
+		        	return 0;
+		        }
+
+		        //Configure Level Shifter Pin
+				if(gen2_pin->level_shifter_pin != NO_PIN) 
+				{
+					pin_confg_ret = pin_config(gen2_pin->level_shifter_pin,io_flag,0,1);
+					if(pin_confg_ret)
+			        { 
+			        	printk(KERN_ALERT "GPIO Request Failed %d\n", gen2_pin->level_shifter_pin); 
+			        	return 0;
+			        }
+				}
+
+				//Configure PINMUX_1 Pin
+				if(gen2_pin->pinmux_1 != NO_PIN) 
+				{
+					pin_confg_ret = pin_config(gen2_pin->pinmux_1,1,gen2_pin->pinmux_1_level,1);
+					if(pin_confg_ret)
+			        { 
+			        	printk(KERN_ALERT "GPIO Request Failed %d\n", gen2_pin->pinmux_1); 
+			        	return 0;
+			        }
+				}
+
+				//Configure PINMUX_2 Pin
+				if(gen2_pin->pinmux_2 != NO_PIN) 
+				{
+					pin_confg_ret = pin_config(gen2_pin->pinmux_2,1,gen2_pin->pinmux_2_level,1);
+					if(pin_confg_ret)
+			        { 
+			        	printk(KERN_ALERT "GPIO Request Failed %d\n", gen2_pin->pinmux_2); 
+			        	return 0;
+			        }
+				}
+			}
+
+		}
+	}
 	return 1;
 }
 
 //Configure Pins on galileo board based on user input
 int configure_galileo_pins(struct hcsr04_device *device)
 {
-	int is_trigger_configured = 0;
-	int is_echo_configured = 0;
-	is_trigger_configured = configure_trigger_pin(device);
-	is_echo_configured = configure_echo_pin(device);
-	if(is_trigger_configured && is_echo_configured)
+	if(configure_pins(device))
 	{
 		return 1;
-	} else
+	} 
+	else
 	{
+		release_gpio_pins(device);
 		return 0;
 	}
 	
@@ -315,7 +492,6 @@ void perform_measurement(struct hcsr04_device *device)
 }
 
 //Device file operation functions
-
 static int hcsr04_open(struct inode *inode, struct file *file)
 {
 	int device_minor = iminor(inode);
@@ -365,7 +541,8 @@ static int hcsr04_write(struct file *file, const char __user *buf,
     {
     	printk(KERN_ALERT "Measurement in progress\n");
     	return EINVAL;
-    } else
+    } 
+    else
     {
     	printk(KERN_ALERT "Initiating new measurement\n");
     	perform_measurement(device);
@@ -384,13 +561,15 @@ static int hcsr04_read(struct file *file, char * buf, size_t count, loff_t *ppos
 	    {
 	    	printk(KERN_ALERT "Measurement in progress\n");
 	    	wait_for_completion (&device->hcsr_measurement_complete); /* Wait till measurement is complete */
-	    } else
+	    } 
+	    else
 	    {
 	    	printk(KERN_ALERT "Initiating new measurement\n");
 	    	perform_measurement(device);
 	    }
 	    	copy_to_user((struct fifo_buffer *)buf, fifoRead(device), sizeof(struct fifo_buffer));
-	} else
+	} 
+	else
 	{
 		copy_to_user((struct fifo_buffer *)buf, buffer, sizeof(struct fifo_buffer));	
 	}
@@ -402,6 +581,7 @@ static int hcsr04_release(struct inode *inode, struct file *file)
 {
 	struct hcsr04_device *device = file->private_data;
 	init_completion(&device->hcsr_measurement_complete);
+	release_gpio_pins(device);
 	initialize_device(device);
 	
 	return SUCCESS;
@@ -419,6 +599,8 @@ static long hcsr04_ioctl(struct file * file, unsigned int ioctlnum, unsigned lon
         	edge_interruptible = is_edge_interruptible(buffer->param_2);
         	if(buffer->param_1 < 0 || buffer->param_1 > 12 || buffer->param_2 < 0 || buffer->param_2 > 12 || !edge_interruptible)
         	{
+        		printk(KERN_ALERT "Wrong Pin numbers\n");
+
         		return EINVAL;
         	}
         	device->trigger_pin = buffer->param_1;
@@ -426,7 +608,7 @@ static long hcsr04_ioctl(struct file * file, unsigned int ioctlnum, unsigned lon
         	device->are_pins_configured = 1;
         	if(!configure_galileo_pins(device))
         	{
-        		printk(KERN_ALERT "Unable to COnfigure pin %d as Trigger and pin %d as Edge pins in Galileo board",
+        		printk(KERN_ALERT "Unable to Configure pin %d as Trigger and pin %d as Edge pins in Galileo board\n",
         			device->trigger_pin,device->echo_pin);
         		return EINVAL;
         	}
@@ -480,7 +662,8 @@ static int __init hcsr04_init(void)
 	    {
 	        printk(KERN_ALERT "Unable to register HCSR_%d device\n",index);
 	        return error;
-	    } else
+	    } 
+	    else
 	    {
 	    	printk(KERN_ALERT "Registered %s with minor no:%d\n",device->misc.name,device->misc.minor);
 	    }
@@ -497,7 +680,6 @@ static void __exit hcsr04_exit(void)
 	int error;
 	struct hcsr04_device *misc_device;
 	struct list_head *pos, *q;
-	
 	list_for_each_safe(pos, q, &hcsr04_device_list.list)
 	{
 		misc_device = list_entry(pos, struct hcsr04_device, list);
@@ -507,9 +689,8 @@ static void __exit hcsr04_exit(void)
 	    }
 		list_del(pos);
 		//free(misc_device);
-	}
-	//TODO: Free gpios
-	    
+	}	
+	release_gpio_pins(NULL);
     printk(KERN_ALERT "HCSR driver deregistered and %d devices deleted\n",devices);
 }
 
