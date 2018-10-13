@@ -7,6 +7,8 @@
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/completion.h>
+#include <linux/ioctl.h>
 
 //TODO: Delete the below headers in final code.
 #include <linux/random.h>
@@ -40,13 +42,29 @@ module_param(devices, int, 0644);
 MODULE_PARM_DESC(devices, "The number of HCSR devices to be created.");
 
 #define SUCCESS 0
+#define NO_PIN -1
+#define NO_VALUE -1
 
 int measurement_in_progress = 0;
 
+//Pins that cannot be configured for both rising and falling edge R/F/B
+static int non_echo_pins[] = {0,1,7,8,10,12};
+
+//Commands
+#define CONFIG_PINS _IOWR(530,1, struct ioctl_buffer)
+#define SET_PARAMETERS _IOWR(530,2, struct ioctl_buffer)
+
 /* Circular FIFO Buffer */
 #define FIFO_ELEMENTS 5 //Total elements in the fifo buffer
-#define FIFO_SIZE (FIFO_ELEMENTS+1) //Helps to distinguish between buffer full and buffer empty
+#define FIFO_SIZE (FIFO_ELEMENTS) //Helps to distinguish between buffer full and buffer empty
 #define BUFFER_EMPTY -1
+
+//IOCTL Struct
+struct ioctl_buffer {
+	int param_1; //Trigger Pin or Number of samples per measureent
+	int param_2; //Echo Pin or Sampling Period in microseconds
+};
+
 
 struct fifo_buffer {
 	int distance; //Save distance measured by hcsr sensor
@@ -62,59 +80,210 @@ struct hcsr04_device {
 	int echo_pin; //Echo gpio value of hcsr device
 	int m; //Total samples to be collected
 	int delta; //Time period of sample collection
-	struct fifo_buffer *buffer[FIFO_SIZE];
+	struct fifo_buffer *buffer[FIFO_SIZE]; //buffer to store measurement samples
 	int FIFOWrite, FIFORead; //Variables to keep track of write and read positions
-
+	struct completion hcsr_measurement_complete; //Mechanism to wait till measurement is complete
+	int are_pins_configured; //1 if pins have not been condigured. 0 otherwise
+	int are_m_delta_configured; //1 of Sampling Period and number of samples to be collected are configured
 } hcsr04_device_list;
 
+//Pin Configuration
+struct gen2_pin_config {
+	int galileo_pin;
+	int linux_gpio_pin;
+	int level_shifter_pin;
+	int pinmux_1;
+	int pinmux_1_level; //1 for High and 0 for Low
+	int pinmux_2;
+	int pinmux_2_level; //1 for High and 0 for Low
+	struct list_head list;
+} gen2_pin_list;
 
-//FIFO functions
-void initialize_fifo_buffer(struct hcsr04_device *device)  
+//Initialize device variables
+//-1 indicates that there is no pin configured
+void initialize_device(struct hcsr04_device *device)  
 {
+	int bufferIndex;
 	device->FIFOWrite = 0;
 	device->FIFORead = 0;
+	device->trigger_pin = NO_PIN;
+	device->echo_pin = NO_PIN;
+	device->m = NO_VALUE;
+	device->delta = NO_VALUE;
+	device->are_pins_configured = 0;
+	device->are_m_delta_configured = 0;
+	bufferIndex = 0;
+	while(bufferIndex < FIFO_SIZE)
+	{
+		device->buffer[bufferIndex] = (struct fifo_buffer *)kmalloc(sizeof(struct fifo_buffer), GFP_KERNEL);
+		device->buffer[bufferIndex]->distance = NO_VALUE;
+		device->buffer[bufferIndex]->tsc = NO_VALUE;
+		bufferIndex++;
+	}
+
 }
 
+//Store data related to a single pin
+//-1 indicates that there is no pin to be configured
+void populate_pin_data(int galileo_pin,int linux_gpio_pin, int level_shifter_pin, 
+	int pinmux_1,int pinmux_1_level, int pinmux_2, int pinmux_2_level)
+{
+	struct gen2_pin_config *gen2_pin;
+	gen2_pin = (struct gen2_pin_config *)kmalloc(sizeof(struct gen2_pin_config), GFP_KERNEL);
+	gen2_pin->galileo_pin = galileo_pin;
+	gen2_pin->linux_gpio_pin = linux_gpio_pin;
+	gen2_pin->level_shifter_pin = level_shifter_pin;
+	gen2_pin->pinmux_1 = pinmux_1;
+	gen2_pin->pinmux_1_level = pinmux_1_level;
+	gen2_pin->pinmux_2 = pinmux_2;
+	gen2_pin->pinmux_2_level = pinmux_2_level;
+	list_add(&(gen2_pin->list), &(gen2_pin_list.list));
+
+}
+
+//Stores Galileo Gen2 Digital Pins configuration data
+//-1 indicates that there is no pin to be configured
+//Source Gen2_pins.xlsx
+int populate_gen2_pins_data(void) 
+{
+	//IO0
+	populate_pin_data(0,11,32,NO_PIN,NO_VALUE,NO_PIN,NO_VALUE);
+	
+
+	//IO1
+	populate_pin_data(1,12,28,45,1,NO_PIN,NO_VALUE);
+
+	//IO2
+	populate_pin_data(2,61,NO_PIN,77,0,NO_PIN,NO_VALUE);
+
+	//IO3
+	populate_pin_data(3,62,NO_PIN,76,0,64,0);
+
+	//IO4
+	populate_pin_data(4,6,36,NO_PIN,NO_VALUE,NO_PIN,NO_VALUE);
+	
+	//IO5
+	populate_pin_data(5,0,18,66,0,NO_PIN,NO_VALUE);
+
+	//IO6
+	populate_pin_data(6,1,20,68,0,NO_PIN,NO_VALUE);
+
+	//IO7
+	populate_pin_data(7,38,NO_PIN,NO_PIN,NO_VALUE,NO_PIN,NO_VALUE);
+
+	//IO8
+	populate_pin_data(8,40,NO_PIN,NO_PIN,NO_VALUE,NO_PIN,NO_VALUE);
+
+	//IO9
+	populate_pin_data(9,4,22,70,0,NO_PIN,NO_VALUE);
+
+	//IO10
+	populate_pin_data(10,10,26,74,0,NO_PIN,NO_VALUE);
+
+	//IO11
+	populate_pin_data(11,5,24,44,0,72,0);
+
+	//IO12
+	populate_pin_data(12,15,42,NO_PIN,NO_VALUE,NO_PIN,NO_VALUE);
+
+	//IO13
+	populate_pin_data(13,7,30,46,0,NO_PIN,NO_VALUE);
+
+	return 1;
+}
+
+//FIFO functions
 // Reads from the buffer and return BUFFER_EMPTY as distance if buffer empty
 struct fifo_buffer* fifoRead(struct hcsr04_device *device) {
    struct fifo_buffer *buffer;
-   if (device->FIFOWrite == device->FIFORead) {
-   	//Buffer is empty
-   	printk(KERN_ALERT "FIFO buffer or device %s is empty\n",device->misc.name);
-   	buffer = (struct fifo_buffer *)kmalloc(sizeof(struct fifo_buffer), GFP_KERNEL);
-   	buffer->distance = BUFFER_EMPTY;
-   	buffer->tsc = 0;
-   	return buffer;
+   buffer = (struct fifo_buffer *)kmalloc(sizeof(struct fifo_buffer), GFP_KERNEL);
+   if (device->buffer[device->FIFOWrite]->tsc == NO_VALUE) {
+	   	//Buffer is empty
+	   	printk(KERN_ALERT "FIFO buffer of device %s is empty\n",device->misc.name);
+	   	buffer->distance = BUFFER_EMPTY;
+	   	buffer->tsc = 0;
+	   	return buffer;
+   } else
+   {
+	   	buffer->distance = device->buffer[device->FIFOWrite]->distance;
+	   	buffer->tsc = device->buffer[device->FIFOWrite]->tsc; 
+	   	//Deleting the values of current location as we have read it
+	   	device->buffer[device->FIFOWrite]->distance = NO_VALUE;
+   		device->buffer[device->FIFOWrite]->tsc = NO_VALUE;  	
    }
-   device->FIFORead = (device->FIFORead + 1) % FIFO_SIZE;
-   return device->buffer[device->FIFORead];
+   device->FIFOWrite = device->FIFOWrite - 1;
+   if(device->FIFOWrite < 0) 
+   {
+   		device->FIFOWrite = FIFO_SIZE - 1;
+   }
+   return buffer;
 }
  
 // Writes to the buffer and overwrites if buffer is full
+//TODO: Not Working
 int fifoWrite(struct hcsr04_device *device, struct fifo_buffer *buffer) 
 {
-   if (device->FIFOWrite + 1 == device->FIFORead) 
-   {
-	   	//Buffer Full
-	   	printk(KERN_ALERT "FIFO buffer or device %s is full. Overwriting oldest measurement\n",device->misc.name);
-   }
    device->FIFOWrite = (device->FIFOWrite + 1) % FIFO_SIZE;
-   device->buffer[device->FIFORead] = buffer;
+   printk(KERN_ALERT "Writing at position %d of %s with ",device->FIFOWrite,device->misc.name);
+   printk(KERN_ALERT "values %d and %llu\n",buffer->distance,buffer->tsc);
+   //device->buffer[device->FIFOWrite] = (struct fifo_buffer *)kmalloc(sizeof(struct fifo_buffer), GFP_KERNEL);
+   device->buffer[device->FIFOWrite]->distance = buffer->distance;
+   device->buffer[device->FIFOWrite]->tsc = buffer->tsc;
+   printk("values written");
    return SUCCESS;
 }
 
 
 
 
+//Configure pin as output pin
+int configure_trigger_pin(struct hcsr04_device *device) 
+{
+	//sprintf(device_name, "HCSR_%d", index);
+	return 1;
+}
 
-/*********************************************************
-TODO: Measurement and GPIO related functions start 
-*********************************************************/
+//Configure pin as edge trigerred input
+int configure_echo_pin(struct hcsr04_device *device)
+{
+	return 1;
+}
 
+//Configure Pins on galileo board based on user input
+int configure_galileo_pins(struct hcsr04_device *device)
+{
+	int is_trigger_configured = 0;
+	int is_echo_configured = 0;
+	is_trigger_configured = configure_trigger_pin(device);
+	is_echo_configured = configure_echo_pin(device);
+	if(is_trigger_configured && is_echo_configured)
+	{
+		return 1;
+	} else
+	{
+		return 0;
+	}
+	
+}
 
-
-
-
+/*Compare pin input by user with pins stored in non_echo_pins array
+ *non_echo_pin array contains pins which cannot be used as echo pin 
+ *as they cannot trigger interrupt on both edges at the same time*/
+int is_edge_interruptible(int echo_pin)
+{
+	int is_edge_interruptible = 1;
+	int index;
+	int non_echo_pins_no;
+	non_echo_pins_no = sizeof(non_echo_pins);
+	for (index=0; index < non_echo_pins_no; index++) 
+	{
+        if (non_echo_pins[index] == echo_pin)
+         {
+         	is_edge_interruptible = 0;
+         }   
+    }
+	return is_edge_interruptible;
+}
 
 
 // Measurement Related Functions
@@ -126,52 +295,51 @@ void perform_measurement(struct hcsr04_device *device)
 	buffer = (struct fifo_buffer *)kmalloc(sizeof(struct fifo_buffer), GFP_KERNEL);
 	
 	//TODO: Output Simulation. Delete in final code. Start
-	
+	//TODO: hrtimer
 	int i, lessthan20;
 	get_random_bytes(&i, sizeof(i));
-	lessthan20 = i % 20;
+	lessthan20 = i % 5;
+	lessthan20 = lessthan20 * lessthan20;
 	buffer->distance = lessthan20;
 
 	//Need mechanism for the thread to wait till measurement is complete
 	msleep(2000);
 
 	//TODO: Output Simulation. Delete in final code. End
-	
 	tsc = rdtsc();
+	buffer->tsc = tsc;
+	printk(KERN_ALERT "distance %d and time %llu",buffer->distance,buffer->tsc);
 	fifoWrite(device,buffer);
 	measurement_in_progress = 0;
+	complete_all(&device->hcsr_measurement_complete);
 }
 
-
-
-
-
-
-
-
-
-/*********************************************************
-TODO: Measurement and GPIO related functions end 
-*********************************************************/
-
-
-
-
-
 //Device file operation functions
+
 static int hcsr04_open(struct inode *inode, struct file *file)
 {
 	int device_minor = iminor(inode);
+	int device_found;
 	struct hcsr04_device *device;
 	struct list_head *pos;
+	device_found = 0;
 	list_for_each(pos, &hcsr04_device_list.list)
 	{
 		device = list_entry(pos, struct hcsr04_device, list);
 		if(device->misc.minor == device_minor)
 		{
+			device_found = 1;
+			printk(KERN_ALERT "device match found\n");
+	    	printk(KERN_ALERT "Opened %s with minor no:%d\n",device->misc.name,device->misc.minor);
+			init_completion(&device->hcsr_measurement_complete);
+	    	initialize_device(device);
 			file->private_data = device;
 			break;
 		}
+	}
+	if(!device_found) 
+	{
+		printk(KERN_ALERT "No device found\n");
 	}
     return SUCCESS;
 }
@@ -181,11 +349,17 @@ static int hcsr04_write(struct file *file, const char __user *buf,
 {
 	int buffer_operation;
     struct hcsr04_device *device = file->private_data;
+    if(!device->are_pins_configured || !device->are_m_delta_configured)
+    {
+    	printk(KERN_ALERT "Please configure the device %s before writing to it\n",device->misc.name);
+    	return EINVAL;
+    }
     copy_from_user(&buffer_operation, (int*)buf, sizeof(int));
     if(buffer_operation != 0)
     {
     	printk(KERN_ALERT "Clearing FIFO buffer of %s\n",device->misc.name);
-    	initialize_fifo_buffer(device);
+    	device->FIFORead = 0;
+    	device->FIFOWrite = 0;
     }
     if(measurement_in_progress)
     {
@@ -195,9 +369,8 @@ static int hcsr04_write(struct file *file, const char __user *buf,
     {
     	printk(KERN_ALERT "Initiating new measurement\n");
     	perform_measurement(device);
-    	copy_to_user((struct fifo_buffer *)buf, fifoRead(device), sizeof(struct fifo_buffer));
-    	return SUCCESS; 
     }
+    return SUCCESS;
 }
 
 static int hcsr04_read(struct file *file, char * buf, size_t count, loff_t *ppos)
@@ -206,41 +379,72 @@ static int hcsr04_read(struct file *file, char * buf, size_t count, loff_t *ppos
 	struct fifo_buffer *buffer = fifoRead(device);
 	if(buffer->distance == BUFFER_EMPTY)
 	{
-		printk(KERN_ALERT "FIFO buffer or device %s is empty\n",device->misc.name);
+		printk(KERN_ALERT "FIFO buffer of device %s is empty\n",device->misc.name);
 		if(measurement_in_progress)
 	    {
 	    	printk(KERN_ALERT "Measurement in progress\n");
-	    	
-	    	//TODO: Delete in final code Start
-	    	
-	    	//Need a mechanism to wait till measurement is in progress
-	    	msleep(2000);
-	    	
-	    	//TODO: Delete in final code End
-
-	    	buffer = fifoRead(device); 
+	    	wait_for_completion (&device->hcsr_measurement_complete); /* Wait till measurement is complete */
 	    } else
 	    {
 	    	printk(KERN_ALERT "Initiating new measurement\n");
 	    	perform_measurement(device);
-	    	copy_to_user((struct fifo_buffer *)buf, fifoRead(device), sizeof(struct fifo_buffer));
-	    	return SUCCESS; 
 	    }
-
+	    	copy_to_user((struct fifo_buffer *)buf, fifoRead(device), sizeof(struct fifo_buffer));
+	} else
+	{
+		copy_to_user((struct fifo_buffer *)buf, buffer, sizeof(struct fifo_buffer));	
 	}
-	copy_to_user((struct fifo_buffer *)buf, fifoRead(device), sizeof(struct fifo_buffer));
 	return SUCCESS;
 }
 
+//TODO: what will this funciton do??
 static int hcsr04_release(struct inode *inode, struct file *file)
 {
-	//TODO: Write release code here
+	struct hcsr04_device *device = file->private_data;
+	init_completion(&device->hcsr_measurement_complete);
+	initialize_device(device);
+	
 	return SUCCESS;
 }
 
 static long hcsr04_ioctl(struct file * file, unsigned int ioctlnum, unsigned long arg)
 {   
-	//TODO: Write ioctl code here
+	struct hcsr04_device *device = file->private_data;
+	struct ioctl_buffer *buffer;
+	int edge_interruptible; //Checks if the echo pin input by the user is edge interrupt enabled
+	switch(ioctlnum) 
+    {
+        case CONFIG_PINS:
+        	buffer = (struct ioctl_buffer*) arg;
+        	edge_interruptible = is_edge_interruptible(buffer->param_2);
+        	if(buffer->param_1 < 0 || buffer->param_1 > 12 || buffer->param_2 < 0 || buffer->param_2 > 12 || !edge_interruptible)
+        	{
+        		return EINVAL;
+        	}
+        	device->trigger_pin = buffer->param_1;
+        	device->echo_pin = buffer->param_2;
+        	device->are_pins_configured = 1;
+        	if(!configure_galileo_pins(device))
+        	{
+        		printk(KERN_ALERT "Unable to COnfigure pin %d as Trigger and pin %d as Edge pins in Galileo board",
+        			device->trigger_pin,device->echo_pin);
+        		return EINVAL;
+        	}
+        	break;
+        case SET_PARAMETERS:
+
+        	buffer = (struct ioctl_buffer*) arg;
+			if(buffer->param_1 <= 0 || buffer->param_2 <= 0)
+        	{
+        		return EINVAL;
+        	}
+        	device->m = buffer->param_1;
+        	device->delta = buffer->param_2;
+        	device->are_m_delta_configured = 1;
+        	break;
+        default:
+        	return EINVAL;
+    }
 	return SUCCESS;
 }
 
@@ -257,28 +461,33 @@ static int __init hcsr04_init(void)
 {
 	int index;
 	int error;
-	struct hcsr04_device *misc_device;
+	struct hcsr04_device *device;
+	char *device_name;
 
 	INIT_LIST_HEAD(&hcsr04_device_list.list);
+	INIT_LIST_HEAD(&gen2_pin_list.list);
 
 	for(index=0; index < devices;index++)
 	{
-		misc_device = (struct hcsr04_device *)kmalloc(sizeof(struct hcsr04_device), GFP_KERNEL);
-		misc_device->misc.minor = MISC_DYNAMIC_MINOR;
-		misc_device->misc.name = "HCSR_"+index;
-		misc_device->misc.fops = &hcsr04_fops;
-
-	    error = misc_register(&(misc_device->misc));
+		device_name = (char *)kmalloc(sizeof(char), GFP_KERNEL);
+		device = (struct hcsr04_device *)kmalloc(sizeof(struct hcsr04_device), GFP_KERNEL);
+		device->misc.minor = MISC_DYNAMIC_MINOR;
+		sprintf(device_name, "HCSR_%d", index);
+		device->misc.name = device_name;
+		device->misc.fops = &hcsr04_fops;
+		error = misc_register(&(device->misc));
 	    if (error) 
 	    {
 	        printk(KERN_ALERT "Unable to register HCSR_%d device\n",index);
 	        return error;
+	    } else
+	    {
+	    	printk(KERN_ALERT "Registered %s with minor no:%d\n",device->misc.name,device->misc.minor);
 	    }
-	    initialize_fifo_buffer(misc_device);
-	    list_add(&(misc_device->list), &(hcsr04_device_list.list));
-
+		initialize_device(device);
+	    list_add(&(device->list), &(hcsr04_device_list.list));
 	}
-
+	populate_gen2_pins_data();
     printk(KERN_ALERT "HCSR driver registered with %d devices created\n",devices);
     return SUCCESS;
 }
@@ -299,6 +508,7 @@ static void __exit hcsr04_exit(void)
 		list_del(pos);
 		//free(misc_device);
 	}
+	//TODO: Free gpios
 	    
     printk(KERN_ALERT "HCSR driver deregistered and %d devices deleted\n",devices);
 }
@@ -309,3 +519,4 @@ module_exit(hcsr04_exit)
 MODULE_DESCRIPTION("HCSR Driver");
 MODULE_AUTHOR("Ravi Bhushan <ravibhushan0487@gmail.com>");
 MODULE_LICENSE("GPL");
+
