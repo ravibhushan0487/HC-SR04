@@ -251,8 +251,8 @@ void release_gpio_pins(struct hcsr04_device *device)
 	{
 		gen2_pin = list_entry(gpio_pos, struct gen2_pin_config, list);
 		
-		//Device is null when all this function is called during exit module
-		//Else, release only those pins which have been set by the device whole release function has been called
+		//Device is null when this function is called in exit module
+		//Else, release only those pins which have been set by the device whose release function has been called
 		if(gen2_pin->is_pin_configured && (device == NULL || device->misc.minor == gen2_pin->device_minor_number))
 		{
 			
