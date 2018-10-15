@@ -74,13 +74,15 @@ struct fifo_buffer {
 	uint64_t tsc; //Save the timestamp at which distance was measured
 };
 
+
 //Distance Sensor device structure
 struct hcsr04_device {
 
 	struct miscdevice misc;
 	struct list_head list;
-	int trigger_pin; //Trigger gpio value of hcsr device
-	int echo_pin; //Echo gpio value of hcsr device
+	//struct hcsr04_irq_data irq; //Stores irq related data
+	int trigger_pin; //Digital IO pin of Galileo acting as Trigger
+	int echo_pin; //Digital IO pin of Galileo acting as Echo
 	int m; //Total samples to be collected
 	int delta; //Time period of sample collection
 	struct fifo_buffer *buffer[FIFO_SIZE]; //buffer to store measurement samples
@@ -324,7 +326,10 @@ void release_gpio_pins(struct hcsr04_device *device)
             }
             gen2_pin->is_pin_configured = 0;
             gen2_pin->device_minor_number = NO_VALUE;
-
+            if(device == NULL)
+            {
+            	kfree(gen2_pin);
+            }
 		} 
 	}
 	    
@@ -731,7 +736,7 @@ static int __init hcsr04_init(void)
 		sprintf(device_name, "HCSR_%d", index);
 		device->misc.name = device_name;
 		device->misc.fops = &hcsr04_fops;
-		error = misc_register(&(device->misc));
+	    error = misc_register(&(device->misc));
 	    if (error) 
 	    {
 	        printk(KERN_ALERT "Unable to register HCSR_%d device\n",index);
@@ -751,7 +756,7 @@ static int __init hcsr04_init(void)
 
 static void __exit hcsr04_exit(void)
 {
-	int error;
+	int error, bufferIndex;
 	struct hcsr04_device *misc_device;
 	struct list_head *pos, *q;
 	list_for_each_safe(pos, q, &hcsr04_device_list.list)
@@ -762,7 +767,13 @@ static void __exit hcsr04_exit(void)
 	        printk(KERN_ALERT "Unable to deregister HCSR device\n");
 	    }
 		list_del(pos);
-		//free(misc_device);
+		bufferIndex = 0;
+		while(bufferIndex < FIFO_SIZE)
+		{
+			kfree(misc_device->buffer[bufferIndex]);
+			bufferIndex++;
+		}
+		kfree(misc_device);
 	}	
 	release_gpio_pins(NULL);
     printk(KERN_ALERT "HCSR driver deregistered and %d devices deleted\n",devices);
@@ -774,4 +785,3 @@ module_exit(hcsr04_exit)
 MODULE_DESCRIPTION("HCSR Driver");
 MODULE_AUTHOR("Ravi Bhushan <ravibhushan0487@gmail.com>");
 MODULE_LICENSE("GPL");
-
