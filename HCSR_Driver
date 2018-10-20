@@ -7,12 +7,15 @@
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
-#include <linux/completion.h>
 #include <linux/ioctl.h>
 #include <linux/gpio.h>
 #include <linux/irq.h>
+#include <linux/kthread.h>
 #include <linux/interrupt.h>
 #include <linux/math64.h>
+#include <linux/semaphore.h>
+#include <linux/spinlock.h>
+#include <linux/spinlock_types.h>
 
 //TODO: Delete the below headers in final code.
 #include <linux/random.h>
@@ -50,7 +53,8 @@ MODULE_PARM_DESC(devices, "The number of HCSR devices to be created.");
 #define NO_VALUE -1
 
 //Pins that cannot be configured for both rising and falling edge R/F/B
-static int non_echo_pins[] = {0,1,7,8,10,12};
+#define NON_ECHO_PINS 6
+static int non_echo_pins[NON_ECHO_PINS] = {0,1,7,8,10,12};
 
 //Commands
 #define CONFIG_PINS _IOWR(530,1, struct ioctl_buffer)
@@ -93,6 +97,7 @@ struct hcsr04_device {
 	struct miscdevice misc;
 	struct list_head list;
 	struct hcsr04_irq_data *irq_data; //Stores irq related data
+	struct task_struct *tsk; //Kthread task struct
 	int trigger_pin; //Digital IO pin of Galileo acting as Trigger
 	int echo_pin; //Digital IO pin of Galileo acting as Echo
 	int m; //Total samples to be collected
@@ -100,8 +105,8 @@ struct hcsr04_device {
 	int measurement_in_progress; //1 if there is an ongoing write operation being carried out for the device.0 otherwise
 	struct fifo_buffer *buffer[FIFO_SIZE]; //buffer to store measurement samples
 	int bufferIndex; //Variable to keep track of the buffer position where read/write operation is to be performed
-	struct completion hcsr_measurement_complete; //Mechanism to wait till measurement is complete
-	struct completion hcsr_read_wait; //Blocks Read call till measurement is complete
+	struct semaphore read_lock; //For signalling buffer read operations
+	spinlock_t buffer_lock; //For syncing buffer write and read operations
 	int are_pins_configured; //1 if pins have not been condigured. 0 otherwise
 	int are_m_delta_configured; //1 of Sampling Period and number of samples to be collected are configured
 } hcsr04_device_list;
@@ -134,8 +139,9 @@ void initialize_device(struct hcsr04_device *device)
 	device->measurement_in_progress = 0;
 	device->are_pins_configured = 0;
 	device->are_m_delta_configured = 0;
-	init_completion(&device->hcsr_measurement_complete);
-	init_completion(&device->hcsr_read_wait);
+	sema_init(&device->read_lock, 0);
+	spin_lock_init(&device->buffer_lock);
+	device->tsk = (struct task_struct *)kmalloc(sizeof(struct task_struct), GFP_KERNEL);
 	device->irq_data = (struct hcsr04_irq_data *)kmalloc(sizeof(struct hcsr04_irq_data), GFP_KERNEL);
 	device->irq_data->irq_no = NO_VALUE;
 	device->irq_data->irq_echo_pin = NO_VALUE;
@@ -370,8 +376,9 @@ void release_gpio_pins(struct hcsr04_device *device)
 **pin: GPIO Linux pin number
 **io_flag: 0 -> Input, 1 -> Output
 **Val: value of the pin. 1 -> High, 0 -> Low
-**configure: 1: Configure pin using gpio_request 0: Update pin*/
-int pin_config(int pin, int io_flag, bool val, int configure)
+**configure: 1: Configure pin using gpio_request 0: Update pin
+**show_log: 1: shows pin configured log 0: no logs are shown*/
+int pin_config(int pin, int io_flag, bool val, int configure, int show_log)
 { 
     int ret;
     char *name;
@@ -379,7 +386,7 @@ int pin_config(int pin, int io_flag, bool val, int configure)
     //below variables are used for display purpose only
    	char *operation, *direction, *cansleep;
     
-    name = (char *)kmalloc(sizeof(char), GFP_KERNEL);
+    name = (char *)kmalloc(sizeof(char)*10, GFP_KERNEL);
 	sprintf(name, "gpio%d", pin);
     
     if(configure)
@@ -399,20 +406,24 @@ int pin_config(int pin, int io_flag, bool val, int configure)
     }
     if (io_flag)
     {
-    	gpio_direction_output(pin, val);
-    	if(val) 
+    	direction="";
+    	if(pin<64)
     	{
-    		direction = "output high";
-    	}
-    	else
-    	{
-    		direction = "output low";
-    	}
+    		gpio_direction_output(pin, val);
+	    	if(val) 
+	    	{
+	    		direction = "as output high";
+	    	}
+	    	else
+	    	{
+	    		direction = "as output low";
+	    	}
+	    }
     }
     else
     {
      	gpio_direction_input(pin); 
-     	direction = "input";  
+     	direction = "as input";  
     }
     if(gpio_cansleep(pin))
     {
@@ -424,7 +435,10 @@ int pin_config(int pin, int io_flag, bool val, int configure)
     	gpio_set_value(pin, 0);
     	cansleep = "cannot sleep";
     }
-    printk(KERN_ALERT "%s pin %s as %s which %s\n",operation,name,direction,cansleep);
+    if(show_log) 
+    {
+    	printk(KERN_ALERT "%s pin %s %s which %s\n",operation,name,direction,cansleep);
+    }
     return 0;
 }
 
@@ -437,17 +451,16 @@ static irqreturn_t irq_handler(int irq, void *dev_id)
 	device = (struct hcsr04_device *)dev_id;
     
     //Need to distinguish between HCSR Echo Pulse Rising and Falling Edge Interrupts
-    //if(device->irq_data->irq_edge == 0)
-    //{
+    if(device->irq_data->irq_edge == 0)
+    {
         //Rising Edge Interrupt
         printk("Interrupt %d occured on rising edge\n",irq);
         device->irq_data->rising_edge_time = rdtsc();
         device->irq_data->irq_edge = 1;//Toggle it as next interrupt will be falling edge
-    //}
-    //else if(device->irq_data->irq_edge == 1)
-    //{
+    }
+    else if(device->irq_data->irq_edge == 1)
+    {
         //Falling Edge Interrupt
-        msleep(100);
         printk("Interrupt %d occured on falling edge\n",irq);
 		device->irq_data->falling_edge_time = rdtsc();
         device->irq_data->irq_edge = 0;
@@ -464,8 +477,7 @@ static irqreturn_t irq_handler(int irq, void *dev_id)
         printk(KERN_ALERT "Distance Measured:%d\n",distance);
         device->irq_data->total_samples = device->irq_data->total_samples + 1;
         device->irq_data->sample_sum = device->irq_data->sample_sum + distance;
-		complete_all(&device->hcsr_measurement_complete);
-    //}
+    }
     
     
     return IRQ_HANDLED;
@@ -483,7 +495,7 @@ int configure_interrupt(struct hcsr04_device *device, int echo_pin_linux)
         printk(KERN_ALERT "GPIO%d cannot be used as echo for %s as interrupt cannot be configured\n",device->echo_pin,device->misc.name);
         return 0;
     }
-    irq_name = (char *)kmalloc(sizeof(char), GFP_KERNEL);
+    irq_name = (char *)kmalloc(sizeof(char)*15, GFP_KERNEL);
 	sprintf(irq_name, "%s_%d", device->misc.name,irq);
     error = request_irq(irq, irq_handler, IRQ_TYPE_EDGE_BOTH, irq_name, (void*)device);
     if(error)
@@ -524,27 +536,28 @@ int configure_pins(struct hcsr04_device *device)
 				//Check if Pin has been configued by the same device. If no then return error
 				if(device->misc.minor != gen2_pin->device_minor_number) 
 				{
-					printk(KERN_ALERT "Pin %d already configured by some other device\n",device->trigger_pin);
-					return 0;
+					printk(KERN_ALERT "Reconfiguring Pin %d for device %s\n",device->trigger_pin,device->misc.name);
 				}
 				//Pin has been configured by the same device. Update Pin's function to be a trigger pin
 				printk(KERN_ALERT "Updating Pins related to IO%d\n",gen2_pin->galileo_pin);
 				
 				//Configure Linux Pin
-				pin_confg_ret = pin_config(gen2_pin->linux_gpio_pin,io_flag,0,0);
+				pin_confg_ret = pin_config(gen2_pin->linux_gpio_pin,io_flag,0,0,1);
 				if(pin_confg_ret)
 		        { 
-		        	printk(KERN_ALERT "GPIO Request Failed %d\n", gen2_pin->linux_gpio_pin); 
+		        	printk(KERN_ALERT "GPIO Request Failed for %d\n", gen2_pin->linux_gpio_pin); 
 		        	return 0;
 		        }
 
 		        //Configure Level Shifter Pin
 				if(gen2_pin->level_shifter_pin != NO_PIN) 
 				{
-					pin_confg_ret = pin_config(gen2_pin->level_shifter_pin,io_flag,0,0);
+					pin_confg_ret = pin_config(gen2_pin->level_shifter_pin,io_flag,0,0,1);
 					if(pin_confg_ret)
 			        { 
-			        	printk(KERN_ALERT "GPIO Request Failed %d\n", gen2_pin->level_shifter_pin); 
+			        	printk(KERN_ALERT "GPIO Request Failed %d\n", gen2_pin->level_shifter_pin);
+			        	//Free Linux Pin configured before
+			        	gpio_free(gen2_pin->linux_gpio_pin); 
 			        	return 0;
 			        }
 				}
@@ -555,7 +568,7 @@ int configure_pins(struct hcsr04_device *device)
 				printk(KERN_ALERT "Configuring Pins related to IO%d\n",gen2_pin->galileo_pin);
 				
 				//Configure Linux Pin
-				pin_confg_ret = pin_config(gen2_pin->linux_gpio_pin,io_flag,0,1);
+				pin_confg_ret = pin_config(gen2_pin->linux_gpio_pin,io_flag,0,1,1);
 				if(pin_confg_ret)
 		        { 
 		        	printk(KERN_ALERT "GPIO Request Failed %d\n", gen2_pin->linux_gpio_pin); 
@@ -565,10 +578,12 @@ int configure_pins(struct hcsr04_device *device)
 		        //Configure Level Shifter Pin
 				if(gen2_pin->level_shifter_pin != NO_PIN) 
 				{
-					pin_confg_ret = pin_config(gen2_pin->level_shifter_pin,io_flag,0,1);
+					pin_confg_ret = pin_config(gen2_pin->level_shifter_pin,io_flag,0,1,1);
 					if(pin_confg_ret)
 			        { 
 			        	printk(KERN_ALERT "GPIO Request Failed %d\n", gen2_pin->level_shifter_pin); 
+			        	//Free Linux Pin configured before
+			        	gpio_free(gen2_pin->linux_gpio_pin); 
 			        	return 0;
 			        }
 				}
@@ -576,10 +591,18 @@ int configure_pins(struct hcsr04_device *device)
 				//Configure PINMUX_1 Pin
 				if(gen2_pin->pinmux_1 != NO_PIN) 
 				{
-					pin_confg_ret = pin_config(gen2_pin->pinmux_1,1,gen2_pin->pinmux_1_level,1);
+					pin_confg_ret = pin_config(gen2_pin->pinmux_1,1,gen2_pin->pinmux_1_level,1,1);
 					if(pin_confg_ret)
 			        { 
 			        	printk(KERN_ALERT "GPIO Request Failed %d\n", gen2_pin->pinmux_1); 
+			        	
+			        	//Free Linux Pin configured before
+			        	gpio_free(gen2_pin->linux_gpio_pin); 
+			        	//Free Level Shifter Pin COnfigured before
+			        	if(gen2_pin->level_shifter_pin != NO_PIN) 
+			        	{
+			        		gpio_free(gen2_pin->level_shifter_pin); 
+			        	}
 			        	return 0;
 			        }
 				}
@@ -587,10 +610,23 @@ int configure_pins(struct hcsr04_device *device)
 				//Configure PINMUX_2 Pin
 				if(gen2_pin->pinmux_2 != NO_PIN) 
 				{
-					pin_confg_ret = pin_config(gen2_pin->pinmux_2,1,gen2_pin->pinmux_2_level,1);
+					pin_confg_ret = pin_config(gen2_pin->pinmux_2,1,gen2_pin->pinmux_2_level,1,1);
 					if(pin_confg_ret)
 			        { 
 			        	printk(KERN_ALERT "GPIO Request Failed %d\n", gen2_pin->pinmux_2); 
+
+			        	//Free Linux Pin configured before
+			        	gpio_free(gen2_pin->linux_gpio_pin); 
+			        	//Free Level Shifter Pin COnfigured before
+			        	if(gen2_pin->level_shifter_pin != NO_PIN) 
+			        	{
+			        		gpio_free(gen2_pin->level_shifter_pin); 
+			        	}
+			        	//Free PINMUX_1 pin configured before
+			        	if(gen2_pin->pinmux_1 != NO_PIN) 
+						{
+							gpio_free(gen2_pin->pinmux_1); 	
+						}
 			        	return 0;
 			        }
 				}
@@ -623,7 +659,6 @@ int configure_galileo_pins(struct hcsr04_device *device)
 	} 
 	else
 	{
-		release_gpio_pins(device);
 		return 0;
 	}
 	
@@ -636,9 +671,7 @@ int is_edge_interruptible(int echo_pin)
 {
 	int is_edge_interruptible = 1;
 	int index;
-	int non_echo_pins_no;
-	non_echo_pins_no = sizeof(non_echo_pins);
-	for (index=0; index < non_echo_pins_no; index++) 
+	for (index=0; index < NON_ECHO_PINS; index++) 
 	{
         if (non_echo_pins[index] == echo_pin)
          {
@@ -650,40 +683,68 @@ int is_edge_interruptible(int echo_pin)
 
 
 //Measurement Related Functions
-//Triggers Interrupt.TODO: it should be inside a thread
-void perform_measurement(struct hcsr04_device *device)
+//Triggers Interrupt
+static int hcsr04_thread_write(void *data)
 {
 	uint64_t tsc;
 	struct fifo_buffer *buffer;
+	struct hcsr04_device *device;
+	int samples_collected, total_samples;
+	unsigned long flags;
+
+	device = (struct hcsr04_device *)data;
+	spin_lock_irqsave(&device->buffer_lock, flags );
+
 	device->measurement_in_progress = 1;
 	buffer = (struct fifo_buffer *)kmalloc(sizeof(struct fifo_buffer), GFP_KERNEL);
+	samples_collected = 0;
+	total_samples = device->m;
+	printk(KERN_ALERT "\nSample Collection for %s write operation\n",device->misc.name);
+	do {
+		if(kthread_should_stop()) {
+			do_exit(0);
+		}
+		printk(KERN_ALERT "Collecting sample no:%d\n",samples_collected);
+		//Set trigger pin to 0
+		//pin_config(device->irq_data->irq_trigger_pin, 1, 0, 0, 0);
+	    //Set Trigger pin to 1
+	    pin_config(device->irq_data->irq_trigger_pin, 1, 1, 0,0); 
+		mdelay(20);    
+		pin_config(device->irq_data->irq_trigger_pin, 1, 0, 0,0);
+		samples_collected++;
+		device->irq_data->total_samples = samples_collected;
+		mdelay(device->delta);
+	}while(samples_collected<=total_samples); 
 	
-	/*//TODO: Output Simulation. Delete in final code. Start
-	//TODO: hrtimer
-	int i, lessthan20;
-	get_random_bytes(&i, sizeof(i));
-	lessthan20 = i % 5;
-	lessthan20 = lessthan20 * lessthan20;
-	buffer->distance = lessthan20;
-
-	//Need mechanism for the thread to wait till measurement is complete
-	msleep(2000);
-
-	//TODO: Output Simulation. Delete in final code. End*/
-	//Set trigger pin to 0
-	pin_config(device->irq_data->irq_trigger_pin, 1, 0, 0);
-    //Set Trigger pin to 1
-    pin_config(device->irq_data->irq_trigger_pin, 1, 1, 0);
-    msleep(1000);
-    pin_config(device->irq_data->irq_trigger_pin, 1, 0, 0);
-
 	//wait_for_completion (&device->hcsr_measurement_complete); /* Wait till measurement is complete */
 	tsc = rdtsc();
 	buffer->tsc = tsc;
-	printk(KERN_ALERT "distance %d and time %llu",buffer->distance,buffer->tsc);
+	buffer->distance = device->irq_data->sample_sum/device->irq_data->total_samples;
 	fifoWrite(device,buffer);
 	device->measurement_in_progress = 0;
-	complete_all(&device->hcsr_read_wait);
+
+	spin_unlock_irqrestore(&device->buffer_lock, flags);
+	up(&device->read_lock);
+	do_exit(0);
+}
+
+//Creates a kernel thread to initiate measurement
+int initiate_measurement(struct hcsr04_device *device)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&device->buffer_lock, flags);
+
+	printk(KERN_ALERT "Initiating new measurement\n");
+	//TODO:call a kernel thread to do this and implement hrtimer there
+	device->tsk = kthread_run(&hcsr04_thread_write, (void *)device, "%s_write", device->misc.name);  
+	if (IS_ERR(device->tsk)) 
+	{
+		printk(KERN_ALERT "Unable to perform write operation for %s device. Unable to create kernel thread.\n",device->misc.name);
+		return 1;
+	}
+
+	spin_unlock_irqrestore(&device->buffer_lock, flags);
+	return 0;
 }
 
 //Device file operation functions
@@ -717,8 +778,9 @@ static int hcsr04_open(struct inode *inode, struct file *file)
 static int hcsr04_write(struct file *file, const char __user *buf, 
 			size_t len, loff_t *ppos)
 {
-	int buffer_operation;
+	int buffer_operation,thread_return;
     struct hcsr04_device *device = file->private_data;
+
     if(!device->are_pins_configured || !device->are_m_delta_configured)
     {
     	printk(KERN_ALERT "Please configure the device %s before writing to it\n",device->misc.name);
@@ -727,27 +789,46 @@ static int hcsr04_write(struct file *file, const char __user *buf,
     copy_from_user(&buffer_operation, (int*)buf, sizeof(int));
     if(buffer_operation != 0)
     {
+    	printk(KERN_ALERT "Stopping any ongoing measurement for %s\n",device->misc.name);
+    	thread_return = kthread_stop(device->tsk);
+        if(!thread_return) 
+        {
+        	printk(KERN_ALERT "There was a problem while stopping write thread of %s\n",device->misc.name);
+        }
     	printk(KERN_ALERT "Clearing FIFO buffer of %s\n",device->misc.name);
     	device->bufferIndex = 0;
     }
     if(device->measurement_in_progress)
     {
-    	printk(KERN_ALERT "Measurement in progress\n");
+    	printk(KERN_ALERT "Measurement in progress from Write\n");
     	return EINVAL;
     } 
     else
     {
-    	printk(KERN_ALERT "Initiating new measurement\n");
-    	//TODO:call a kernel thread to do this and implement hrtimer there
-    	perform_measurement(device);
+		//Initiating new measurement
+		if(!initiate_measurement(device))
+		{
+			return EINVAL;
+		}
+		
     }
     return SUCCESS;
 }
 
 static int hcsr04_read(struct file *file, char * buf, size_t count, loff_t *ppos)
 {
-	struct hcsr04_device *device = file->private_data;
-	struct fifo_buffer *buffer = fifoRead(device);
+	struct hcsr04_device *device;
+	struct fifo_buffer *buffer;
+	unsigned long flags;
+
+	device = file->private_data;
+
+	spin_lock_irqsave(&device->buffer_lock, flags);
+
+	buffer = fifoRead(device);
+
+	spin_unlock_irqrestore(&device->buffer_lock, flags);
+
 	if(buffer->distance == BUFFER_EMPTY)
 	{
 		printk(KERN_ALERT "FIFO buffer of device %s is empty\n",device->misc.name);
@@ -760,28 +841,43 @@ static int hcsr04_read(struct file *file, char * buf, size_t count, loff_t *ppos
 		if(device->measurement_in_progress)
 	    {
 	    	printk(KERN_ALERT "Measurement in progress\n");
-	    	wait_for_completion (&device->hcsr_read_wait); /* Wait till measurement is complete */
 	    } 
 	    else
 	    {
-	    	printk(KERN_ALERT "Initiating new measurement\n");
-	    	perform_measurement(device);
+	    	//Initiating new measurement
+			if(!initiate_measurement(device))
+			{
+				return EINVAL;
+			}
 	    }
+	    	/* Wait till measurement is complete */
+	    	spin_lock_irqsave(&device->buffer_lock, flags);
+
 	    	copy_to_user((struct fifo_buffer *)buf, fifoRead(device), sizeof(struct fifo_buffer));
+
+			spin_unlock_irqrestore(&device->buffer_lock, flags);
 	} 
-	else
-	{
-		copy_to_user((struct fifo_buffer *)buf, buffer, sizeof(struct fifo_buffer));	
-	}
+	
+	copy_to_user((struct fifo_buffer *)buf, buffer, sizeof(struct fifo_buffer));	
+	
 	return SUCCESS;
 }
 
 //Reset data related to a device
 static int hcsr04_release(struct inode *inode, struct file *file)
 {
+	int thread_return;
 	struct hcsr04_device *device = file->private_data;
 	print_device_data(device);
 	printk(KERN_ALERT "Erasing data of %s and reinitializing it\n",device->misc.name);
+	if(device->measurement_in_progress)
+	{
+		thread_return = kthread_stop(device->tsk);
+	    if(!thread_return) 
+	    {
+	    	printk(KERN_ALERT "There was a problem while stopping write thread of %s\n",device->misc.name);
+	    }
+	}
 	if(device->irq_data->irq_no != NO_VALUE)
 	{
 		printk(KERN_ALERT "Freeing IRQ %d of %s on IO%d\n",device->irq_data->irq_no,device->misc.name,device->echo_pin);
@@ -818,7 +914,7 @@ static long hcsr04_ioctl(struct file * file, unsigned int ioctlnum, unsigned lon
         		device->echo_pin = NO_VALUE;
         		device->irq_data->irq_no = NO_VALUE;
         	}
-        	release_gpio_pins(device);
+        	//release_gpio_pins(device);
         	device->trigger_pin = buffer->param_1;
         	device->echo_pin = buffer->param_2;
         	//Configure device with new pins
@@ -865,10 +961,10 @@ static int __init hcsr04_init(void)
 
 	INIT_LIST_HEAD(&hcsr04_device_list.list);
 	INIT_LIST_HEAD(&gen2_pin_list.list);
-
+	//TODO: Please check output of kmalloc. If it is null or not????
 	for(index=0; index < devices;index++)
 	{
-		device_name = (char *)kmalloc(sizeof(char), GFP_KERNEL);
+		device_name = (char *)kmalloc(sizeof(char)*10, GFP_KERNEL);
 		device = (struct hcsr04_device *)kmalloc(sizeof(struct hcsr04_device), GFP_KERNEL);
 		device->misc.minor = MISC_DYNAMIC_MINOR;
 		sprintf(device_name, "HCSR_%d", index);
@@ -912,6 +1008,7 @@ static void __exit hcsr04_exit(void)
 			bufferIndex++;
 		}
 		kfree(misc_device->irq_data);
+		kfree(misc_device->tsk);
 		kfree(misc_device);
 	}	
 	release_gpio_pins(NULL);
