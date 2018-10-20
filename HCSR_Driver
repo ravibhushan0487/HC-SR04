@@ -699,7 +699,8 @@ static int hcsr04_thread_write(void *data)
 	samples_collected = 0;
 	total_samples = device->m;
 	printk(KERN_ALERT "\nSample Collection for %s write operation\n",device->misc.name);
-	do {
+	while(samples_collected <= (total_samples + 2)) 
+	{
 		/*if(kthread_should_stop()) {
 			do_exit(0);
 		}*/
@@ -712,7 +713,7 @@ static int hcsr04_thread_write(void *data)
 		samples_collected++;
 		device->irq_data->total_samples = samples_collected;
 		mdelay(device->delta);
-	}while(samples_collected<=total_samples); 
+	}
 	
 	//wait_for_completion (&device->hcsr_measurement_complete); /* Wait till measurement is complete */
 	tsc = rdtsc();
