@@ -454,14 +454,14 @@ static irqreturn_t irq_handler(int irq, void *dev_id)
     if(device->irq_data->irq_edge == 0)
     {
         //Rising Edge Interrupt
-        printk("Interrupt %d occured on rising edge\n",irq);
+        //printk("Interrupt %d occured on rising edge\n",irq);
         device->irq_data->rising_edge_time = rdtsc();
         device->irq_data->irq_edge = 1;//Toggle it as next interrupt will be falling edge
     }
     else if(device->irq_data->irq_edge == 1)
     {
         //Falling Edge Interrupt
-        printk("Interrupt %d occured on falling edge\n",irq);
+        //printk("Interrupt %d occured on falling edge\n",irq);
 		device->irq_data->falling_edge_time = rdtsc();
         device->irq_data->irq_edge = 0;
         echo_pulse_width = (device->irq_data->rising_edge_time - device->irq_data->falling_edge_time);
@@ -474,7 +474,7 @@ static irqreturn_t irq_handler(int irq, void *dev_id)
         {
         	device->irq_data->outlier_lowest = distance;	
         }
-        printk(KERN_ALERT "Distance Measured:%d\n",distance);
+        printk(KERN_ALERT "Distance Measured for %s:%d\n",device->misc.name,distance);
         device->irq_data->total_samples = device->irq_data->total_samples + 1;
         device->irq_data->sample_sum = device->irq_data->sample_sum + distance;
     }
@@ -695,16 +695,14 @@ static int hcsr04_thread_write(void *data)
 	device = (struct hcsr04_device *)data;
 	spin_lock_irqsave(&device->buffer_lock, flags );
 
-	device->measurement_in_progress = 1;
 	buffer = (struct fifo_buffer *)kmalloc(sizeof(struct fifo_buffer), GFP_KERNEL);
 	samples_collected = 0;
 	total_samples = device->m;
 	printk(KERN_ALERT "\nSample Collection for %s write operation\n",device->misc.name);
 	do {
-		if(kthread_should_stop()) {
+		/*if(kthread_should_stop()) {
 			do_exit(0);
-		}
-		printk(KERN_ALERT "Collecting sample no:%d\n",samples_collected);
+		}*/
 		//Set trigger pin to 0
 		//pin_config(device->irq_data->irq_trigger_pin, 1, 0, 0, 0);
 	    //Set Trigger pin to 1
@@ -734,7 +732,7 @@ int initiate_measurement(struct hcsr04_device *device)
 	unsigned long flags;
 	spin_lock_irqsave(&device->buffer_lock, flags);
 
-	printk(KERN_ALERT "Initiating new measurement\n");
+	printk(KERN_ALERT "Initiating new measurement for device %s\n",device->misc.name);
 	//TODO:call a kernel thread to do this and implement hrtimer there
 	device->tsk = kthread_run(&hcsr04_thread_write, (void *)device, "%s_write", device->misc.name);  
 	if (IS_ERR(device->tsk)) 
@@ -778,7 +776,7 @@ static int hcsr04_open(struct inode *inode, struct file *file)
 static int hcsr04_write(struct file *file, const char __user *buf, 
 			size_t len, loff_t *ppos)
 {
-	int buffer_operation,thread_return;
+	int buffer_operation;
     struct hcsr04_device *device = file->private_data;
 
     if(!device->are_pins_configured || !device->are_m_delta_configured)
@@ -789,23 +787,18 @@ static int hcsr04_write(struct file *file, const char __user *buf,
     copy_from_user(&buffer_operation, (int*)buf, sizeof(int));
     if(buffer_operation != 0)
     {
-    	printk(KERN_ALERT "Stopping any ongoing measurement for %s\n",device->misc.name);
-    	thread_return = kthread_stop(device->tsk);
-        if(!thread_return) 
-        {
-        	printk(KERN_ALERT "There was a problem while stopping write thread of %s\n",device->misc.name);
-        }
     	printk(KERN_ALERT "Clearing FIFO buffer of %s\n",device->misc.name);
     	device->bufferIndex = 0;
     }
     if(device->measurement_in_progress)
     {
-    	printk(KERN_ALERT "Measurement in progress from Write\n");
+    	printk(KERN_ALERT "Measurement in progress from %s\n",device->misc.name);
     	return EINVAL;
     } 
     else
     {
 		//Initiating new measurement
+		device->measurement_in_progress = 1;
 		if(!initiate_measurement(device))
 		{
 			return EINVAL;
